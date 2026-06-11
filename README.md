@@ -1,136 +1,311 @@
-# boilerplate-cli-ui-go-v2-vue
+<p align="center">
+  <img src="https://img.shields.io/badge/version-1.0.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
+  <img src="https://img.shields.io/badge/go-1.21-orange" alt="Go">
+</p>
 
-Go CLI with embedded Vue 3 web UI. Single binary, no runtime dependencies.
-Part of [SuperCLI](https://github.com/javimosch/supercli) - build CLI/UI plugins fast for 2026.
-| Stack | Repo | Binary | SDK Size |
-|-------|------|--------|----------|
-| Go + inline HTML | [boilerplate-cli-ui-go](https://github.com/javimosch/boilerplate-cli-ui-go) | ~5MB | ~150MB |
-| **Go + Vue 3 CDN** | **boilerplate-cli-ui-go-v2-vue** | **~5MB** |
-| Go + React 18 CDN | [boilerplate-cli-ui-go-v2-react](https://github.com/javimosch/boilerplate-cli-ui-go-v2-react) | ~5MB | ~150MB |
-| Deno + vanilla JS | [boilerplate-cli-ui-deno](https://github.com/javimosch/boilerplate-cli-ui-deno) | ~76MB | ~100MB |
-| Node.js + vanilla JS | [boilerplate-cli-ui-node](https://github.com/javimosch/boilerplate-cli-ui-node) | ~123MB | ~500MB+ |
-| Python + React CDN | [boilerplate-cli-ui-python](https://github.com/javimosch/boilerplate-cli-ui-python) | ~10MB | ~300MB |
-| Rust + vanilla JS | [boilerplate-cli-ui-rust](https://github.com/javimosch/boilerplate-cli-ui-rust) | ~1.1MB | ~800MB |
-| .NET 8 + Vue 3 | [boilerplate-cli-ui-dotnet](https://github.com/javimosch/boilerplate-cli-ui-dotnet) | ~89MB | ~600MB |
-| C++ + Vue 3 | [boilerplate-cli-ui-cpp](https://github.com/javimosch/boilerplate-cli-ui-cpp) | ~493KB | ~2GB+ |
-| Nim + Vue 3 | [boilerplate-cli-ui-nim](https://github.com/javimosch/boilerplate-cli-ui-nim) | ~364KB | ~50MB |
-| Zig + Vue 3 | [boilerplate-cli-ui-zig](https://github.com/javimosch/boilerplate-cli-ui-zig) | ~190KB | ~50MB |
-| Dart + Vue 3 | [boilerplate-cli-ui-dart](https://github.com/javimosch/boilerplate-cli-ui-dart) | ~6.4MB | ~400MB |
-|| V + Vue 3 | [boilerplate-cli-ui-v](https://github.com/javimosch/boilerplate-cli-ui-v) | ~1.2MB | ~5MB |
-|| Crystal + Vue 3 | [boilerplate-cli-ui-crystal](https://github.com/javimosch/boilerplate-cli-ui-crystal) | ~3.1MB | ~50MB |
-## Architecture
-```
-boilerplate-cli-ui-go-v2/
-├── main.go           # CLI entry point (start, stop, status, version)
-├── server.go         # HTTP server with go:embed for UI files
-├── daemon.go         # Daemon management (pid file, signals)
-├── ui/               # Frontend (embedded at compile time)
-│   ├── index.html    # Entry point (Vue 3 from CDN)
-│   ├── css/
-│   │   └── app.css
-│   └── js/
-│       ├── app.js
-│       ├── components/
-│       │   ├── AppLayout.js
-│       │   ├── Sidebar.js
-│       │   └── StatusCard.js
-│       └── views/
-│           ├── Dashboard.js
-│           └── Settings.js
-├── go.mod
-├── build.sh
-└── README.md
-## Key Feature: `go:embed`
-Frontend files are **separate** but **embedded into the binary** at compile time:
-```go
-//go:embed ui/*
-var uiFiles embed.FS
-**Benefits:**
-- Single binary output (no runtime file dependencies)
-- Separate HTML/CSS/JS files (proper syntax highlighting)
-- No build step for frontend (CDN-based Vue/React)
-- Hot-reload during development (serve from disk)
-## Build
+<h1 align="center">debri 🗑️ Fresh Devin Session Invoker</h1>
+
+<p align="center">
+  <b>Go CLI for fresh devin sessions with streaming JSONL output.</b><br>
+  <b>Avoids session-reuse slowdowns.</b>
+</p>
+
+> Think: "devin, but fresh sessions every time"
+
+## ⚡ TL;DR
+
+> Single-shot devin CLI with streaming JSONL output — designed for automation.
+
 ```bash
-chmod +x build.sh
-./build.sh
-Output: Single binary `boilerplate-cli-ui-go-v2`
-## Usage
-# Start server (foreground)
-./boilerplate-cli-ui-go-v2 start
-# Start on custom port
-./boilerplate-cli-ui-go-v2 start -port 3000
-# Start as daemon
-./boilerplate-cli-ui-go-v2 start -daemon
-# Stop daemon
-./boilerplate-cli-ui-go-v2 stop
-# Check status
-./boilerplate-cli-ui-go-v2 status
-## API Endpoints
-| Endpoint | Description |
-|----------|-------------|
-| `GET /` | Web UI |
-| `GET /api/status` | Server status (JSON) |
-| `GET /api/health` | Health check (JSON) |
-## Frontend Stack
-- **Vue 3** (CDN) - Reactive UI
-- **Tailwind CSS** (CDN) - Utility-first styling
-- **Lucide Icons** (CDN) - Icon library
-- **Hashbang routing** - `#/dashboard`, `#/settings`
-No npm, no build step. Just open `ui/index.html` in your editor.
-## Hashbang Routing
-Routes use hashbang URLs:
-- `http://localhost:8080/#/dashboard` - Dashboard view
-- `http://localhost:8080/#/settings` - Settings view
-- `http://localhost:8080/` - Defaults to dashboard
-## Development
-### Option 1: Edit embedded files
-1. Edit files in `ui/`
-2. Run `go run .` (files are re-embedded each run)
-3. Refresh browser
-### Option 2: Serve from disk (faster)
-For development, you can serve files directly from disk:
-// In server.go, temporarily replace:
-// uiSub, _ := fs.Sub(uiFiles, "ui")
-// fileServer := http.FileServer(http.FS(uiSub))
-// With:
-fileServer := http.FileServer(http.Dir("ui"))
-This allows hot-reload without recompiling.
-## Adding New Views
-1. Create `ui/js/views/MyView.js`:
-```javascript
-const MyView = {
-    template: `
-        <div>
-            <h2>My View</h2>
-            <!-- Your content -->
-        </div>
-    `,
-    setup() {
-        // Composition API logic
-    }
-};
-2. Register in `ui/js/app.js`:
-app.component('my-view', MyView);
-3. Add route in `ui/js/components/AppLayout.js`:
-// Add to navItems array
-{ id: 'my-view', label: 'My View', icon: 'star' }
-// Add to template
-<my-view v-if="currentView === 'my-view'"></my-view>
-## Adding New API Endpoints
-1. Add handler in `server.go`:
-func handleMyEndpoint(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(map[string]string{"hello": "world"})
-}
-2. Register in `startServer()`:
-mux.HandleFunc("/api/my-endpoint", handleMyEndpoint)
-## Comparison with v1
-| Aspect | v1 (boilerplate-cli-ui-go) | v2 (this) |
-|--------|---------------------------|-----------|
-| HTML location | String literal in .go file | Separate `ui/` directory |
-| Syntax highlighting | No | Yes |
-| Component separation | No | Yes (js/components/) |
-| Scalability | Poor | Good |
-| Binary output | Single | Single |
-| Frontend framework | Inline HTML | Vue 3 (CDN) |
+# Fresh session, clean output
+debri "List the files in src/"
+
+# Streaming JSONL events
+debri --stream "Analyze the codebase"
+
+# Single JSON output
+debri --json "Summarize this"
+
+# Read prompt from file
+debri --file prompt.txt
+
+# With model selection
+debri --model "SWE-1.6" "Create a file"
+```
+
+👉 Streaming JSONL events for monitoring
+👉 Auto-strips devin TUI chrome
+👉 Fresh sessions avoid slowdowns
+👉 Single binary, no dependencies
+
+## The Problem
+
+Devin sessions get slower over time:
+- **Session reuse** → accumulated state slows down each prompt
+- **TUI chrome** → braille logos, status bars clutter output
+- **No structured output** → parsing text responses is fragile
+- **No automation** → interactive mode doesn't work in scripts
+
+Without debri, automation struggles to:
+1. Get clean, structured output from devin
+2. Avoid session-reuse slowdowns
+3. Monitor progress in real-time
+4. Integrate with CI/CD pipelines
+
+## The Solution
+
+debri gives automation what it needs:
+- **Fresh sessions** — new tmux session per prompt, auto-cleanup
+- **Streaming JSONL** — structured events: init, chunk, done, error
+- **TUI chrome stripping** — clean output, no braille logos or status bars
+- **Single binary** — statically compiled Go, no runtime dependencies
+- **Model support** — SWE-1.6, Kimi K2.6, and other devin-supported models
+- **Auto-confirm dialogs** — handles workspace trust prompts automatically
+
+With debri:
+1. **Execute** with `debri "prompt"` — fresh session, clean output
+2. **Monitor** with `--stream` — real-time JSONL events
+3. **Integrate** with `--json` — single structured JSON response
+4. **Automate** with `--file` — read prompts from files
+5. **Customize** with `--model`, `--permission-mode`, `--working-dir`
+
+---
+
+## ⚡ Quick Start
+
+```bash
+# Quick install (curl)
+curl -fsSL https://github.com/javimosch/debri/releases/download/v1.0.0/debri -o /usr/local/bin/debri && chmod +x /usr/local/bin/debri
+
+# Fresh session, clean output
+debri "What is Zig?"
+
+# Streaming JSONL events
+debri --stream "Analyze the project structure"
+
+# Single JSON output
+debri --json "Summarize this error"
+
+# Read prompt from file
+debri --file prompt.txt
+
+# With model selection
+debri --model "SWE-1.6" "Create a file"
+
+# With working directory
+debri --working-dir ~/project "List files"
+```
+
+---
+
+## For Humans
+
+| Instead of... | You do... |
+|--------------|-----------|
+| Slow devin sessions | `debri "prompt"` — fresh session every time |
+| TUI chrome in output | Auto-stripped — clean output only |
+| Text parsing | JSONL streaming or single JSON output |
+| Manual trust prompts | Auto-confirmed automatically |
+
+What this means day-to-day:
+- **No session slowdowns** — fresh session every prompt
+- **No TUI chrome** — clean output, no braille logos
+- **No text parsing** — structured JSONL or JSON output
+- **No manual prompts** — workspace trust auto-confirmed
+
+## For Automation
+
+- 🎯 **Fresh sessions** — New tmux session per prompt, auto-cleanup
+- 📡 **Streaming JSONL** — Real-time events: init, chunk, done, error
+- 🧹 **TUI chrome stripping** — Clean output, no braille logos or status bars
+- 📦 **Single binary** — Statically compiled Go, no runtime dependencies
+- 🤖 **Model support** — SWE-1.6, Kimi K2.6, and other devin-supported models
+- 🔐 **Auto-confirm dialogs** — Handles workspace trust prompts automatically
+- ⚙️ **Configurable** — Model, permission mode, working directory, timeout
+
+```bash
+# Automation workflow: fresh session → stream → json → file
+debri "prompt"                    # Fresh session, clean output
+debri --stream "task"            # JSONL streaming events
+debri --json "task"              # Single JSON response
+debri --file prompt.txt          # Read prompt from file
+```
+
+---
+
+## What You Get
+
+debri gives automation a fresh devin session invoker:
+
+- 🎯 **Fresh sessions** — New tmux session per prompt, auto-cleanup
+- 📡 **Streaming JSONL** — Real-time events: init, chunk, done, error
+- 🧹 **TUI chrome stripping** — Clean output, no braille logos or status bars
+- 📦 **Single binary** — Statically compiled Go, no runtime dependencies
+- 🤖 **Model support** — SWE-1.6, Kimi K2.6, and other devin-supported models
+- 🔐 **Auto-confirm dialogs** — Handles workspace trust prompts automatically
+- ⚙️ **Configurable** — Model, permission mode, working directory, timeout
+- 📝 **Prompt files** — Read prompts from files for complex workflows
+
+---
+
+## 🛠️ CLI Usage Examples
+
+```bash
+# Fresh session, clean output
+debri "What is Zig?"
+debri --model "SWE-1.6" "Explain this error"
+
+# Streaming JSONL events
+debri --stream "Run: echo hello"
+debri --stream "Analyze src/"
+
+# Single JSON output
+debri --json "Summarize this"
+debri --json "What is 2+2?"
+
+# Read prompt from file
+debri --file prompt.txt
+debri --file complex-prompt.txt
+
+# With model selection
+debri --model "SWE-1.6" "Create a file"
+debri --model "Kimi K2.6" "Analyze this"
+
+# With working directory
+debri --working-dir ~/project "List files"
+debri --working-dir ~/project --stream "Analyze code"
+
+# With permission mode
+debri --permission-mode dangerous "Execute command"
+debri --permission-mode auto "Read-only task"
+
+# With stability timeout
+debri --stable-timeout 10000 "Long-running task"
+```
+
+---
+
+## 🏗️ Architecture
+
+### Core Design
+
+debri is a **fresh session invoker** for devin:
+
+- **Fresh sessions** — New tmux session per prompt, auto-cleanup
+- **Streaming JSONL** — Structured events for monitoring
+- **TUI chrome stripping** — Clean output, no braille logos or status bars
+- **Single binary** — Statically compiled Go, no runtime dependencies
+
+### Session Lifecycle
+
+1. **Create tmux session** — Unique name: `devin-debri-<timestamp>`
+2. **Write prompt file** — `<workdir>/.devin/debri-prompt-<timestamp>.txt`
+3. **Invoke devin** — `devin -p --permission-mode dangerous --prompt-file <file>`
+4. **Poll pane** — Every 250ms using watermark approach
+5. **Strip chrome** — Remove TUI chrome from output
+6. **Cleanup** — Kill tmux session, remove prompt file
+
+### TUI Chrome Stripping
+
+Automatically strips devin TUI chrome:
+- Braille art (logo)
+- Version strings
+- Status bars (Pro · X% remaining)
+- Context indicators
+- Thinking/Running indicators
+- Workspace trust prompts (auto-confirmed)
+- Shell prompts
+
+### Streaming JSONL Events
+
+```json
+{"event":"init","status":"ok"}
+{"event":"chunk","content":"..."}
+{"event":"done","content":"...","elapsed_ms":1234}
+{"event":"error","error":"...","elapsed_ms":1234}
+```
+
+---
+
+## 📦 Installation
+
+### Quick Install (curl)
+
+```bash
+curl -fsSL https://github.com/javimosch/debri/releases/download/v1.0.0/debri -o /usr/local/bin/debri && chmod +x /usr/local/bin/debri
+```
+
+### Build from Source
+
+```bash
+git clone https://github.com/javimosch/debri.git
+cd debri
+go build -o debri .
+sudo mv debri /usr/local/bin/
+```
+
+### Requirements
+
+- Go 1.21+ (for building from source)
+- tmux (for session management)
+- devin CLI (for execution)
+
+---
+
+## 🎯 CLI Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--model <model>` | string | devin default | Model to use (e.g., "SWE-1.6", "Kimi K2.6") |
+| `--permission-mode <mode>` | string | dangerous | Permission mode: "auto" or "dangerous" |
+| `--working-dir <dir>` | string | cwd | Working directory for the session |
+| `--stream` | flag | false | Emit streaming JSONL events |
+| `--json` | flag | false | Emit final result as single JSON object |
+| `--file <path>` | string | — | Read prompt from file |
+| `--stable-timeout <ms>` | int | 5000 | Stability timeout in ms (silence = done) |
+| `--version` | flag | — | Print version |
+| `-h, --help` | flag | — | Show help |
+
+---
+
+## 🚨 Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success |
+| `80` | User error (bad args) |
+| `100` | Integration error (devin failed) |
+
+---
+
+## 📚 Documentation
+
+- [Landing Page](docs/index.html) — Visual overview and architecture
+- [Changelog](docs/changelog-2026-06.html) — Product and technical changes
+- [AGENTS.md](AGENTS.md) — Agent guide for contributing
+
+---
+
+## 🤝 Contributing
+
+debri is designed for automation and CI/CD integration. Contributions are welcome:
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Submit a pull request
+
+---
+
+## 📄 License
+
+MIT License — see LICENSE file for details.
+
+---
+
+## 🙏 Acknowledgments
+
+- Built with Go 1.21
+- Inspired by devin-bridge TypeScript implementation
+- Uses tmux for session management

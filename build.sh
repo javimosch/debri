@@ -1,14 +1,13 @@
 #!/bin/bash
-# Build script for boilerplate-cli-ui-go-v2
-# Compiles to a single binary with embedded UI
+# Build script for debri
+# Compiles to a single static binary
 
 set -e
 
-APP_NAME="boilerplate-cli-ui-go-v2"
+APP_NAME="debri"
 
 echo "Building ${APP_NAME}..."
 
-# Build with optimizations
 go build -ldflags="-s -w" -o ${APP_NAME} .
 
 echo "Built: ${APP_NAME}"
@@ -16,7 +15,7 @@ ls -lh ${APP_NAME}
 
 echo ""
 echo "Usage:"
-echo "  ./${APP_NAME} start           # Start server with UI"
-echo "  ./${APP_NAME} start -daemon   # Start as daemon"
-echo "  ./${APP_NAME} stop            # Stop daemon"
-echo "  ./${APP_NAME} status          # Check daemon status"
+echo "  ./${APP_NAME} \"say hi\""
+echo "  ./${APP_NAME} --model SWE-1.6 --stream \"create a file\""
+echo "  ./${APP_NAME} --json \"summarize this\""
+echo "  ./${APP_NAME} --file prompt.txt"

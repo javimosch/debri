@@ -1,3 +1,3 @@
-module boilerplate-cli-ui-go-v2
+module debri
 
 go 1.21
