@@ -75,8 +75,11 @@ With debri:
 ## ⚡ Quick Start
 
 ```bash
-# Quick install (curl)
+# Quick install (curl) - downloads binary from GitHub releases
 curl -fsSL https://github.com/javimosch/debri/releases/download/v1.0.0/debri -o /usr/local/bin/debri && chmod +x /usr/local/bin/debri
+
+# Verify installation
+debri --version
 
 # Fresh session, clean output
 debri "What is Zig?"
