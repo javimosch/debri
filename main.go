@@ -12,6 +12,20 @@ import (
 const Version = "1.0.0"
 
 func main() {
+	// Subcommand dispatch — checked before flag parsing so flags don't interfere.
+	if len(os.Args) >= 2 && os.Args[1] == "probe" {
+		// `debri probe [--timeout <s>]` — lightweight harness health check.
+		// Used by automaintainer's probeHarness("debri") to verify devin is
+		// functional (auth valid, tmux available) without starting a real session.
+		timeout := 10
+		for i := 2; i < len(os.Args)-1; i++ {
+			if os.Args[i] == "--timeout" {
+				fmt.Sscanf(os.Args[i+1], "%d", &timeout)
+			}
+		}
+		os.Exit(runProbe(timeout))
+	}
+
 	fs := flag.NewFlagSet("debri", flag.ContinueOnError)
 	fs.Usage = printHelp
 
@@ -119,6 +133,7 @@ func printHelp() {
 Usage:
   debri [options] "<prompt>"
   debri [options] --file prompt.txt
+  debri probe [--timeout <s>]   Verify devin is functional (used by AM harness probe)
 
 Options:
   --model <model>            Model to use (default: devin default)
@@ -148,5 +163,9 @@ Exit codes:
   0    Success
   80   User error (bad args)
   100  Integration error (devin failed)
+
+probe exit codes:
+  0    Healthy (devin responsive, no auth errors detected)
+  1    Unhealthy (reason on stderr)
 `, Version)
 }
