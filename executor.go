@@ -223,7 +223,10 @@ func buildDevinCommand(opts ExecOptions, promptFile string) string {
 	parts = append(parts, "--permission-mode", shellQuote(permMode))
 
 	if opts.WorkingDir != "" {
-		parts = append(parts, "--config", shellQuote(opts.WorkingDir+"/.devin/config.json"))
+		cfgPath := opts.WorkingDir + "/.devin/config.json"
+		if _, err := os.Stat(cfgPath); err == nil {
+			parts = append(parts, "--config", shellQuote(cfgPath))
+		}
 	}
 
 	parts = append(parts, "-p", "--prompt-file", shellQuote(promptFile))
@@ -261,14 +264,18 @@ func tmuxKill(session string) error {
 }
 
 func tmuxSend(session, keys string) error {
-	return exec.Command("tmux", "send-keys", "-t", session+":0.0", keys).Run()
+	// Target the session by name only — no :window.pane suffix — so the command
+	// works regardless of the operator's tmux pane-base-index setting. Using
+	// ":0.0" fails when pane-base-index=1, causing executor to see "session gone"
+	// even though devin is still running.
+	return exec.Command("tmux", "send-keys", "-t", session, keys).Run()
 }
 
 func tmuxSendEnter(session string) error {
-	return exec.Command("tmux", "send-keys", "-t", session+":0.0", "Enter").Run()
+	return exec.Command("tmux", "send-keys", "-t", session, "Enter").Run()
 }
 
 func tmuxCapture(session string) (string, error) {
-	out, err := exec.Command("tmux", "capture-pane", "-t", session+":0.0", "-p", "-J").Output()
+	out, err := exec.Command("tmux", "capture-pane", "-t", session, "-p", "-J").Output()
 	return string(out), err
 }
