@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -84,6 +86,25 @@ func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, err
 		return "", fmt.Errorf("cannot create tmux session: %w", newErr)
 	}
 	defer tmuxKill(sessionName) //nolint: errcheck
+
+	// A caller that kills debri externally (e.g. `kill $pid` from an a2a team's
+	// teardown, while this agent is still blocked mid-task) sends SIGTERM/SIGINT
+	// straight to the process — Go's normal deferred cleanup above does NOT run
+	// on a raw signal-terminated process, so without this the tmux session leaks
+	// forever. Trap the signal, kill the exact session by the name we already
+	// hold, then exit.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sigCh)
+	go func() {
+		sig, ok := <-sigCh
+		if !ok {
+			return
+		}
+		fmt.Fprintf(os.Stderr, "[debri] received %v, cleaning up session %s\n", sig, sessionName)
+		tmuxKill(sessionName) //nolint: errcheck
+		os.Exit(130)
+	}()
 
 	// Short pause for tmux to settle
 	time.Sleep(500 * time.Millisecond)
