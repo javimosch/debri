@@ -64,10 +64,24 @@ func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, err
 		os.Remove(tmpFile) //nolint: errcheck
 	}()
 
-	// Create a fresh tmux session
-	sessionName := fmt.Sprintf("devin-debri-%d", time.Now().UnixMilli())
-	if err := tmuxNew(sessionName, workDir); err != nil {
-		return "", fmt.Errorf("cannot create tmux session: %w", err)
+	// Create a fresh tmux session. Include the PID so concurrent debri processes
+	// (e.g. a spawned a2a team, or parallel batch runs) can never collide on the
+	// name — UnixMilli alone duplicates when two starts land in the same
+	// millisecond, and `tmux new-session` then fails with exit 1. Retry with a
+	// bumped suffix as a further guard against a lingering same-name session.
+	base := fmt.Sprintf("devin-debri-%d-%d", time.Now().UnixMilli(), os.Getpid())
+	sessionName := base
+	var newErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		if attempt > 0 {
+			sessionName = fmt.Sprintf("%s-%d", base, attempt)
+		}
+		if newErr = tmuxNew(sessionName, workDir); newErr == nil {
+			break
+		}
+	}
+	if newErr != nil {
+		return "", fmt.Errorf("cannot create tmux session: %w", newErr)
 	}
 	defer tmuxKill(sessionName) //nolint: errcheck
 
