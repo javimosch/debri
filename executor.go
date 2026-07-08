@@ -15,6 +15,8 @@ type ExecOptions struct {
 	PermMode      string // "auto" or "dangerous"
 	WorkingDir    string // working directory for the session
 	StableTimeout int    // ms of silence before considering output done
+	DoneMarker    string // if the agent prints this line, finish immediately
+	                      // (stable-timeout becomes a safety cap, not the signal)
 }
 
 const (
@@ -104,6 +106,7 @@ func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, err
 		thinkingStart        time.Time
 		lastRealOutputCount  int
 		capturing            bool
+		sawDevinRunning      bool // pane foreground was observed to be non-shell
 	)
 
 	for i := 0; i < maxPolls; i++ {
@@ -149,6 +152,59 @@ func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, err
 		cleanLines := extractCleanLines(rawPane)
 		responseStart := findResponseStart(cleanLines)
 		responseLines := cleanLines[responseStart:]
+
+		// Process-exit completion (primary signal): once we've positively seen
+		// devin running (pane foreground = a non-shell), a return to an idle
+		// shell means devin finished and handed the pane back. This needs no
+		// cooperation from the agent and is immune to the `a2a recv --wait`
+		// silence that forced the long stable-timeout cap. Gate on
+		// sawDevinRunning so the shell state at startup (before devin launches)
+		// can't fake an instant completion.
+		if seenPrompt {
+			if paneForegroundIsShell(sessionName) {
+				if sawDevinRunning {
+					if len(responseLines) > sentLineCount {
+						for _, l := range responseLines[sentLineCount:] {
+							if l != "" && (opts.DoneMarker == "" || !strings.Contains(l, opts.DoneMarker)) {
+								if onChunk != nil {
+									onChunk(l)
+								}
+								allSentLines = append(allSentLines, l)
+							}
+						}
+					}
+					fmt.Fprintf(os.Stderr, "[debri] devin exited (pane back to shell) at poll %d, finishing\n", i)
+					break
+				}
+			} else {
+				sawDevinRunning = true
+			}
+		}
+
+		// Done-marker fast path: the agent signals completion explicitly (e.g. a
+		// reactive a2a peer that has just marked itself `status done` and echoed
+		// the marker). Scan the RAW pane, not the response-sliced output — devin
+		// returns to a fresh shell prompt after the echo, and findResponseStart
+		// would slice the marker line away. Require the marker on its own line
+		// (trimmed line == marker) so it can't match narration that merely quotes
+		// the echo command. stable-timeout stays a safety cap for when the agent
+		// forgets to print it. Reactive work — like blocking on `a2a recv
+		// --wait N` — no longer risks a mid-wait stable-timeout kill, because the
+		// real exit is now the marker, not silence.
+		if opts.DoneMarker != "" && paneHasMarkerLine(rawPane, opts.DoneMarker) {
+			if len(responseLines) > sentLineCount {
+				for _, l := range responseLines[sentLineCount:] {
+					if l != "" && !strings.Contains(l, opts.DoneMarker) {
+						if onChunk != nil {
+							onChunk(l)
+						}
+						allSentLines = append(allSentLines, l)
+					}
+				}
+			}
+			fmt.Fprintf(os.Stderr, "[debri] done-marker seen at poll %d, finishing\n", i)
+			break
+		}
 
 		// Thinking timeout
 		stuckSec := getStuckSeconds(rawPane)
@@ -199,6 +255,40 @@ func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, err
 	}
 
 	return strings.Join(allSentLines, "\n"), nil
+}
+
+// knownShells are the foreground commands that mean the pane has returned to an
+// idle prompt. devin runs in `-p` (single-prompt) mode and exits when the task
+// is complete, handing the pane back to the shell — a far more reliable "done"
+// signal than a model-emitted marker (which the agent may narrate instead of
+// run) or a silence timer (which a blocking `a2a recv --wait` trips falsely).
+var knownShells = map[string]bool{
+	"zsh": true, "-zsh": true, "bash": true, "-bash": true,
+	"sh": true, "-sh": true, "dash": true, "fish": true, "-fish": true,
+}
+
+// paneForegroundIsShell reports whether the pane's current foreground command is
+// an idle shell (i.e. devin has exited). Returns false on any tmux error so a
+// transient failure never fakes a completion.
+func paneForegroundIsShell(session string) bool {
+	out, err := exec.Command("tmux", "display-message", "-p", "-t", session,
+		"#{pane_current_command}").Output()
+	if err != nil {
+		return false
+	}
+	return knownShells[strings.TrimSpace(string(out))]
+}
+
+// paneHasMarkerLine reports whether any line of the raw tmux pane, trimmed of
+// surrounding whitespace, equals the marker exactly. Exact-line match (not
+// substring) so a narration line that quotes the echo command does not trip it.
+func paneHasMarkerLine(rawPane, marker string) bool {
+	for _, line := range strings.Split(rawPane, "\n") {
+		if strings.TrimSpace(line) == marker {
+			return true
+		}
+	}
+	return false
 }
 
 // buildDevinCommand assembles the devin CLI invocation string.

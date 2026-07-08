@@ -36,6 +36,7 @@ func main() {
 	jsonOut := fs.Bool("json", false, "Emit final result as single JSON object")
 	promptFile := fs.String("file", "", "Read prompt from file instead of argument")
 	stableTimeout := fs.Int("stable-timeout", 5000, "Stability timeout in ms (silence = done)")
+	doneMarker := fs.String("done-marker", "", "Finish as soon as the agent prints this line (stable-timeout becomes a safety cap). Useful for reactive agents that block on I/O and would otherwise trip the silence timer.")
 	ver := fs.Bool("version", false, "Print version and exit")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
@@ -80,6 +81,7 @@ func main() {
 		PermMode:      *permMode,
 		WorkingDir:    *workingDir,
 		StableTimeout: *stableTimeout,
+		DoneMarker:    *doneMarker,
 	}
 
 	start := time.Now()
@@ -143,6 +145,9 @@ Options:
   --json                     Emit final result as single JSON object
   --file <path>              Read prompt from file
   --stable-timeout <ms>      Stability timeout in ms (default: 5000)
+  --done-marker <str>        Finish the instant the agent prints this line
+                             (stable-timeout becomes a safety cap). For reactive
+                             agents that block on I/O (e.g. a2a recv --wait).
   --version                  Print version
   -h, --help                 Show this help
 
