@@ -127,8 +127,20 @@ func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, err
 		time.Sleep(pollIntervalMs * time.Millisecond)
 
 		rawPane, err := tmuxCapture(sessionName)
-		if err != nil || strings.Contains(rawPane, "can't find session") || strings.TrimSpace(rawPane) == "" {
-			fmt.Fprintln(os.Stderr, "[debri] session gone, stopping poll")
+		// The session going missing (tmux errors, or reports no such session) is
+		// never a legitimate completion path — devin's own exit hands the pane
+		// back to the shell (see the process-exit check below) rather than
+		// killing the session. This only happens when something external killed
+		// it (crash, OOM, another process, host issue), so surface it as an
+		// error instead of silently reporting success with whatever partial
+		// output was collected — a caller (or a2a agent) needs to be able to
+		// tell "finished" from "the session vanished mid-task".
+		if err != nil || strings.Contains(rawPane, "can't find session") {
+			return strings.Join(allSentLines, "\n"), fmt.Errorf(
+				"devin tmux session disappeared unexpectedly after %d polls (crashed, killed externally, or host issue)", i)
+		}
+		if strings.TrimSpace(rawPane) == "" {
+			fmt.Fprintln(os.Stderr, "[debri] pane empty, stopping poll")
 			break
 		}
 
