@@ -134,8 +134,12 @@ func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, err
 		// it (crash, OOM, another process, host issue), so surface it as an
 		// error instead of silently reporting success with whatever partial
 		// output was collected — a caller (or a2a agent) needs to be able to
-		// tell "finished" from "the session vanished mid-task".
-		if err != nil || strings.Contains(rawPane, "can't find session") {
+		// tell "finished" from "the session vanished mid-task". Checked via err
+		// alone: tmuxCapture uses exec.Cmd.Output(), which returns stdout only —
+		// tmux's "can't find session" text is written to stderr, never to
+		// rawPane, so a string-match against rawPane here can never fire; err
+		// non-nil is the sole real signal.
+		if err != nil {
 			return strings.Join(allSentLines, "\n"), fmt.Errorf(
 				"devin tmux session disappeared unexpectedly after %d polls (crashed, killed externally, or host issue)", i)
 		}
