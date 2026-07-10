@@ -18,12 +18,12 @@ type ExecOptions struct {
 	WorkingDir    string // working directory for the session
 	StableTimeout int    // ms of silence before considering output done
 	DoneMarker    string // if the agent prints this line, finish immediately
-	                      // (stable-timeout becomes a safety cap, not the signal)
+	// (stable-timeout becomes a safety cap, not the signal)
 }
 
 const (
 	pollIntervalMs    = 250
-	maxPolls          = 14400          // 60 min hard cap
+	maxPolls          = 14400         // 60 min hard cap
 	thinkingTimeoutMs = 5 * 60 * 1000 // 5 min thinking timeout
 )
 
@@ -57,13 +57,23 @@ func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, err
 		// Fall back to /tmp if we can't write to the working dir
 		devinDir = "/tmp"
 	}
-	tmpFile := fmt.Sprintf("%s/debri-prompt-%d.txt", devinDir, time.Now().UnixMilli())
+	nowMs := time.Now().UnixMilli()
+	tmpFile := fmt.Sprintf("%s/debri-prompt-%d.txt", devinDir, nowMs)
 	if err := os.WriteFile(tmpFile, []byte(prompt), 0644); err != nil {
 		return "", fmt.Errorf("cannot write prompt file: %w", err)
 	}
-	// Cleanup at end (after devin has read it)
+	// devin `-p` buffers its whole response and prints it only at exit, and it
+	// renders a redrawing TUI to the pane while working — so scraping the tmux
+	// pane for the response is unreliable (transient spinner frames inflate the
+	// line watermark, and the final summary is dropped by the diff). Instead
+	// redirect devin's stdout to a file: with stdout not a TTY, devin writes its
+	// clean plain-text response there, which we read on completion. The pane is
+	// used only for liveness (process-exit / trust dialog / stuck detection).
+	outFile := fmt.Sprintf("%s/debri-output-%d.txt", devinDir, nowMs)
+	// Cleanup at end (after devin has read the prompt / we've read the output)
 	defer func() {
 		os.Remove(tmpFile) //nolint: errcheck
+		os.Remove(outFile) //nolint: errcheck
 	}()
 
 	// Create a fresh tmux session. Include the PID so concurrent debri processes
@@ -110,17 +120,17 @@ func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, err
 	time.Sleep(500 * time.Millisecond)
 
 	// Build the devin command
-	cmd := buildDevinCommand(opts, tmpFile)
+	cmd := buildDevinCommand(opts, tmpFile, outFile)
 	fmt.Fprintf(os.Stderr, "[debri] session=%s cmd=%s\n", sessionName, cmd)
 
 	// Capture pane snapshot before sending command
 	preSnap, _ := tmuxCapture(sessionName)
 
 	// Clear screen then run
-	tmuxSend(sessionName, "C-l")   //nolint: errcheck
+	tmuxSend(sessionName, "C-l") //nolint: errcheck
 	time.Sleep(200 * time.Millisecond)
-	tmuxSend(sessionName, cmd)     //nolint: errcheck
-	tmuxSendEnter(sessionName)     //nolint: errcheck
+	tmuxSend(sessionName, cmd)  //nolint: errcheck
+	tmuxSendEnter(sessionName)  //nolint: errcheck
 	time.Sleep(2 * time.Second) // let devin read the prompt file and start
 
 	stableMs := opts.StableTimeout
@@ -133,15 +143,15 @@ func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, err
 	initialThreshold := 300000 / pollIntervalMs
 
 	var (
-		sentLineCount        int
-		stablePolls          int
-		seenPrompt           bool
-		gotFirstOutput       bool
-		allSentLines         []string
-		thinkingStart        time.Time
-		lastRealOutputCount  int
-		capturing            bool
-		sawDevinRunning      bool // pane foreground was observed to be non-shell
+		sentLineCount       int
+		stablePolls         int
+		seenPrompt          bool
+		gotFirstOutput      bool
+		allSentLines        []string
+		thinkingStart       time.Time
+		lastRealOutputCount int
+		capturing           bool
+		sawDevinRunning     bool // pane foreground was observed to be non-shell
 	)
 
 	for i := 0; i < maxPolls; i++ {
@@ -204,6 +214,11 @@ func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, err
 		responseStart := findResponseStart(cleanLines)
 		responseLines := cleanLines[responseStart:]
 
+		// Pane foreground command, sampled once per poll and reused below for both
+		// the process-exit completion signal and the stability-kill gate. A single
+		// tmux call keeps the two decisions consistent within a poll.
+		fgIsShell := seenPrompt && paneForegroundIsShell(sessionName)
+
 		// Process-exit completion (primary signal): once we've positively seen
 		// devin running (pane foreground = a non-shell), a return to an idle
 		// shell means devin finished and handed the pane back. This needs no
@@ -212,7 +227,7 @@ func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, err
 		// sawDevinRunning so the shell state at startup (before devin launches)
 		// can't fake an instant completion.
 		if seenPrompt {
-			if paneForegroundIsShell(sessionName) {
+			if fgIsShell {
 				if sawDevinRunning {
 					if len(responseLines) > sentLineCount {
 						for _, l := range responseLines[sentLineCount:] {
@@ -291,8 +306,27 @@ func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, err
 			}
 		}
 
-		// Stability check
-		if gotFirstOutput || seenPrompt {
+		// Stability check.
+		//
+		// A visually-static pane while devin is STILL the foreground process is
+		// NOT idleness — devin `-p` (print mode) buffers its response and emits no
+		// incremental pane output during long operations: a long model turn, or a
+		// long tool call such as running the whole test suite. Its final summary
+		// only lands the instant it exits. Counting that quiet-but-working state
+		// toward the stable-timeout kills a live agent mid-task — the tmux session
+		// is torn down before devin commits, so the caller sees zero commits and
+		// empty output (observed on large repos: the agent runs ~10min, goes
+		// "stable", and is killed before it ever writes anything).
+		//
+		// devin exits on its own when done — the process-exit path above is the
+		// reliable completion signal for print mode. So only count stability once
+		// devin is no longer the foreground process; while it's running, reset the
+		// counter. The stable-timeout then only guards a truly wedged pane (e.g.
+		// stuck at a prompt the shell is back but detection missed), and the
+		// thinking-timeout + 60min maxPolls remain as hang backstops.
+		if sawDevinRunning && !fgIsShell {
+			stablePolls = 0
+		} else if gotFirstOutput || seenPrompt {
 			stablePolls++
 			threshold := stableThreshold
 			if !gotFirstOutput {
@@ -305,6 +339,15 @@ func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, err
 		}
 	}
 
+	// Prefer devin's redirected stdout — its clean, complete plain-text response —
+	// over the pane-scraped lines, which drop the final buffered summary. Fall
+	// back to the scraped lines if the file is missing/empty (e.g. devin was
+	// interrupted before flushing, or an older devin that ignores the redirect).
+	if data, err := os.ReadFile(outFile); err == nil {
+		if s := strings.TrimSpace(string(data)); s != "" {
+			return s, nil
+		}
+	}
 	return strings.Join(allSentLines, "\n"), nil
 }
 
@@ -342,8 +385,12 @@ func paneHasMarkerLine(rawPane, marker string) bool {
 	return false
 }
 
-// buildDevinCommand assembles the devin CLI invocation string.
-func buildDevinCommand(opts ExecOptions, promptFile string) string {
+// buildDevinCommand assembles the devin CLI invocation string. devin's stdout
+// (its buffered plain-text response) is redirected to outFile so the caller can
+// read a clean result rather than scraping the redrawing tmux pane; stderr stays
+// on the pane so liveness detection (process-exit, stuck/trust dialogs) still
+// works.
+func buildDevinCommand(opts ExecOptions, promptFile, outFile string) string {
 	var parts []string
 
 	// Resolve devin path
@@ -371,6 +418,11 @@ func buildDevinCommand(opts ExecOptions, promptFile string) string {
 	}
 
 	parts = append(parts, "-p", "--prompt-file", shellQuote(promptFile))
+
+	// Redirect stdout (the response) to a file; stderr stays on the pane.
+	if outFile != "" {
+		parts = append(parts, ">", shellQuote(outFile))
+	}
 
 	return strings.Join(parts, " ")
 }
