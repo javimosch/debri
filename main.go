@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const Version = "1.1.0"
+const Version = "1.2.0"
 
 func main() {
 	// Subcommand dispatch — checked before flag parsing so flags don't interfere.

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.2.0-blue" alt="Version">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
   <img src="https://img.shields.io/badge/go-1.21-orange" alt="Go">
 </p>
@@ -76,7 +76,7 @@ With debri:
 
 ```bash
 # Quick install (curl) - downloads binary from GitHub releases
-curl -fsSL https://github.com/javimosch/debri/releases/download/v1.0.0/debri -o /usr/local/bin/debri && chmod +x /usr/local/bin/debri
+curl -fsSL https://github.com/javimosch/debri/releases/latest/download/debri -o /usr/local/bin/debri && chmod +x /usr/local/bin/debri
 
 # Verify installation
 debri --version
@@ -236,7 +236,7 @@ Automatically strips devin TUI chrome:
 ### Quick Install (curl)
 
 ```bash
-curl -fsSL https://github.com/javimosch/debri/releases/download/v1.0.0/debri -o /usr/local/bin/debri && chmod +x /usr/local/bin/debri
+curl -fsSL https://github.com/javimosch/debri/releases/latest/download/debri -o /usr/local/bin/debri && chmod +x /usr/local/bin/debri
 ```
 
 ### Build from Source
