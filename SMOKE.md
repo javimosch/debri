@@ -1,1 +1,1 @@
-debri smoke test ran
+cursor smoke test ran
