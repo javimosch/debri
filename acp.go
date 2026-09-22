@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -66,6 +67,35 @@ type acpClient struct {
 	// closed fires when the agent's stdout ends, so a request never waits out the full
 	// timeout for a process that has already died (e.g. a devin build with no `acp`).
 	closed chan struct{}
+
+	// lastActivity is the UnixNano of the most recent line from the agent. It is what makes
+	// --stable-timeout an idle timer again rather than a wall-clock cap.
+	lastActivity atomic.Int64
+}
+
+// idleWatcher closes the returned channel once nothing has arrived from the agent for idle.
+// It polls rather than resetting a timer per line, so a chatty agent costs nothing.
+func (c *acpClient) idleWatcher(ctx context.Context, idle time.Duration) <-chan struct{} {
+	fired := make(chan struct{})
+	go func() {
+		tick := time.NewTicker(idle / 10)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-c.closed:
+				return
+			case <-tick.C:
+				last := c.lastActivity.Load()
+				if last > 0 && time.Since(time.Unix(0, last)) > idle {
+					close(fired)
+					return
+				}
+			}
+		}
+	}()
+	return fired
 }
 
 type acpResponse struct {
@@ -158,6 +188,7 @@ func (c *acpClient) readLoop(stdout io.Reader, done chan<- error) {
 		if line == "" {
 			continue
 		}
+		c.lastActivity.Store(time.Now().UnixNano())
 		var msg acpMessage
 		if json.Unmarshal([]byte(line), &msg) != nil {
 			continue // not JSON-RPC (stray output); ignore rather than abort the turn
@@ -380,6 +411,9 @@ func executeACP(ctx context.Context, prompt string, opts ExecOptions, workDir st
 	fmt.Fprintf(os.Stderr, "[debri] acp session=%s mode=%s\n", sess.SessionID, mode)
 
 	// --- the turn ---
+	c.lastActivity.Store(time.Now().UnixNano())
+	idleFired := c.idleWatcher(ctx, time.Duration(opts.StableTimeout)*time.Millisecond)
+
 	promptDone := make(chan error, 1)
 	go func() {
 		_, perr := c.request(ctx, "session/prompt", map[string]any{
@@ -393,6 +427,17 @@ func executeACP(ctx context.Context, prompt string, opts ExecOptions, workDir st
 		c.textM.Lock()
 		defer c.textM.Unlock()
 		return strings.TrimSpace(c.text.String()), nil
+	}
+
+	// windDown asks the agent to stop before the deferred kill takes it, so it can flush, and
+	// returns whatever it had already produced alongside the reason it was stopped.
+	windDown := func(reason error) (string, error) {
+		c.notify("session/cancel", map[string]any{"sessionId": sess.SessionID})
+		time.Sleep(200 * time.Millisecond)
+		c.textM.Lock()
+		partial := strings.TrimSpace(c.text.String())
+		c.textM.Unlock()
+		return partial, reason
 	}
 
 	select {
@@ -424,13 +469,9 @@ func executeACP(ctx context.Context, prompt string, opts ExecOptions, workDir st
 			return "", fmt.Errorf("%w: acp stream ended: %v", errACPUnavailable, err)
 		}
 		return "", fmt.Errorf("%w: acp stream closed during handshake", errACPUnavailable)
+	case <-idleFired:
+		return windDown(fmt.Errorf("devin went silent for %dms", opts.StableTimeout))
 	case <-ctx.Done():
-		// Ask the agent to stop before killing it, so it can wind down cleanly.
-		c.notify("session/cancel", map[string]any{"sessionId": sess.SessionID})
-		time.Sleep(200 * time.Millisecond)
-		c.textM.Lock()
-		partial := strings.TrimSpace(c.text.String())
-		c.textM.Unlock()
-		return partial, fmt.Errorf("devin exceeded the %dms cap", opts.StableTimeout)
+		return windDown(fmt.Errorf("devin exceeded the %dms max runtime", opts.MaxRuntime))
 	}
 }

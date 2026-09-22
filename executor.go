@@ -18,22 +18,37 @@ import (
 )
 
 type ExecOptions struct {
-	Model         string // devin model name (empty = devin default)
-	PermMode      string // "auto" (read-only) or "dangerous"
-	WorkingDir    string // working directory for the session
-	StableTimeout int    // ms: hard cap on the whole run
-	DoneMarker    string // finish as soon as this text appears (meaningful again under ACP)
-	Thoughts      bool   // stream the agent's reasoning as {"event":"thought"}
-	NoACP         bool   // force the legacy `devin -p` path instead of ACP
+	Model      string // devin model name (empty = devin default)
+	PermMode   string // "auto" (read-only) or "dangerous"
+	WorkingDir string // working directory for the session
+	// StableTimeout is ms of *silence*: under ACP the run is cancelled only when nothing has
+	// arrived from the agent for this long. On the -p fallback, where nothing arrives until
+	// exit, it degrades to a hard cap on the run.
+	StableTimeout int
+	// MaxRuntime is the absolute ceiling on an ACP run regardless of how chatty the agent is,
+	// so a livelocked agent cannot burn credits forever.
+	MaxRuntime int
+	DoneMarker string // finish as soon as this text appears (meaningful again under ACP)
+	Thoughts   bool   // stream the agent's reasoning as {"event":"thought"}
+	NoACP      bool   // force the legacy `devin -p` path instead of ACP
 	// OnEvent receives the richer structured events ACP makes available (tool calls,
 	// thoughts). nil is fine; plain text chunks still go to Execute's onChunk.
 	OnEvent func(map[string]any)
 }
 
-// defaultRunTimeoutMs bounds a run when the caller does not pass --stable-timeout. Pre-1.3.0
-// this was a 5s *silence* timer against a scraped tmux pane; as a hard cap on the run, 5s would
-// kill every real task, so the default is the old pane-scraper's 10 minute tick ceiling.
+// defaultRunTimeoutMs is the default --stable-timeout: 10 minutes of silence from the agent.
+//
+// 1.3.0 briefly redefined this as a hard cap on the whole run, because the -p fallback produces
+// no output at all until it exits, so silence could not be measured. That quietly killed every
+// task longer than the caller's value -- mago passes 600000 meaning "10 min idle" and lost a
+// finished-but-uncommitted memgraph#9 run at the 10 minute mark. ACP restores real activity
+// signal, so silence is measurable again and the flag means what its callers always assumed.
 const defaultRunTimeoutMs = 600000
+
+// defaultMaxRuntimeMs is the absolute ceiling on one ACP run. Silence alone cannot bound a run:
+// an agent stuck in a retry loop stays chatty forever. Two hours is far above any real task here
+// and far below "burning credits overnight unnoticed".
+const defaultMaxRuntimeMs = 7200000
 
 var safeNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 
@@ -60,16 +75,22 @@ func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, err
 		return "", fmt.Errorf("invalid model name: %q", opts.Model)
 	}
 
-	timeoutMs := opts.StableTimeout
-	if timeoutMs <= 0 {
-		timeoutMs = defaultRunTimeoutMs
+	if opts.StableTimeout <= 0 {
+		opts.StableTimeout = defaultRunTimeoutMs
 	}
-	opts.StableTimeout = timeoutMs
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
-	defer cancel()
+	if opts.MaxRuntime <= 0 {
+		opts.MaxRuntime = defaultMaxRuntimeMs
+	}
+	if opts.MaxRuntime < opts.StableTimeout {
+		// An idle budget larger than the ceiling can never be reached; honour the larger of the
+		// two rather than silently applying a cap the caller did not ask for.
+		opts.MaxRuntime = opts.StableTimeout
+	}
 
 	if !opts.NoACP {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(opts.MaxRuntime)*time.Millisecond)
 		content, err := executeACP(ctx, prompt, opts, workDir, onChunk)
+		cancel()
 		if err == nil {
 			return content, nil
 		}
@@ -79,12 +100,12 @@ func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, err
 			return content, err
 		}
 		fmt.Fprintf(os.Stderr, "[debri] acp unavailable (%v) — falling back to devin -p\n", err)
-		if ctx.Err() != nil {
-			// The handshake consumed the whole budget; report that plainly rather than
-			// letting the fallback fail with an opaque "cannot start devin".
-			return "", fmt.Errorf("devin exceeded the %dms cap", opts.StableTimeout)
-		}
 	}
+
+	// The -p path gets no output until devin exits, so there is no silence to measure: the idle
+	// budget is the only bound available and degrades to a hard cap on the run.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(opts.StableTimeout)*time.Millisecond)
+	defer cancel()
 	return executePrint(ctx, prompt, opts, workDir, onChunk)
 }
 

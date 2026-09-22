@@ -234,3 +234,41 @@ func TestACP_ToolCallWithArrayContentIsNotDropped(t *testing.T) {
 		t.Error("tool_call with array content was dropped; title/kind never surfaced")
 	}
 }
+
+// TestACP_LongRunSurvivesStableTimeout is the regression guard for the v1.3.0 semantic break:
+// --stable-timeout is ms of SILENCE, not a wall-clock cap. The stub keeps talking for well past
+// the idle budget, which under the 1.3.0 behaviour killed the run (and did, live: mago's
+// `--stable-timeout 600000` meant "10 min idle" and lost a finished memgraph#9 run at 10 min).
+func TestACP_LongRunSurvivesStableTimeout(t *testing.T) {
+	// Chatter every 100ms for ~1.5s against a 500ms idle budget: three times the budget in
+	// wall-clock, never a 500ms gap.
+	acpStub(t, `      i=0
+      while [ $i -lt 15 ]; do
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"."}}}}\n'
+        sleep 0.1
+        i=$((i+1))
+      done
+`)
+	out, err := Execute("hi", ExecOptions{
+		WorkingDir: t.TempDir(), StableTimeout: 500, MaxRuntime: 60000,
+	}, nil)
+	if err != nil {
+		t.Fatalf("a chatty long run must not be cancelled: %v", err)
+	}
+	if !strings.Contains(out, "world") {
+		t.Errorf("run was cut short; got %q", out)
+	}
+}
+
+// TestACP_SilenceCancels: the flip side -- a genuinely wedged agent is still cancelled, and the
+// error says silence rather than blaming the wall clock.
+func TestACP_SilenceCancels(t *testing.T) {
+	acpStub(t, "      sleep 30\n")
+
+	_, err := Execute("hi", ExecOptions{
+		WorkingDir: t.TempDir(), StableTimeout: 600, MaxRuntime: 60000,
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "silent") {
+		t.Errorf("expected a silence error, got: %v", err)
+	}
+}

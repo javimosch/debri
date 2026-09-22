@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const Version = "1.4.0"
+const Version = "1.4.1"
 
 func main() {
 	// Subcommand dispatch — checked before flag parsing so flags don't interfere.
@@ -35,7 +35,8 @@ func main() {
 	stream := fs.Bool("stream", false, "Emit streaming JSONL events to stdout")
 	jsonOut := fs.Bool("json", false, "Emit final result as single JSON object")
 	promptFile := fs.String("file", "", "Read prompt from file instead of argument")
-	stableTimeout := fs.Int("stable-timeout", defaultRunTimeoutMs, "Hard cap on the run, in ms (was a silence timer pre-1.3.0)")
+	stableTimeout := fs.Int("stable-timeout", defaultRunTimeoutMs, "Ms of silence from the agent before the run is cancelled")
+	maxRuntime := fs.Int("max-runtime", defaultMaxRuntimeMs, "Absolute ceiling on one run, in ms, however chatty the agent is")
 	doneMarker := fs.String("done-marker", "", "Finish as soon as the agent prints this line. Largely moot since devin -p emits only at exit; kept for compatibility.")
 	thoughts := fs.Bool("thoughts", false, "Stream the agent's reasoning as {\"event\":\"thought\"} (ACP only)")
 	noACP := fs.Bool("no-acp", false, "Use the legacy `devin -p` path instead of ACP streaming")
@@ -83,6 +84,7 @@ func main() {
 		PermMode:      *permMode,
 		WorkingDir:    *workingDir,
 		StableTimeout: *stableTimeout,
+		MaxRuntime:    *maxRuntime,
 		DoneMarker:    *doneMarker,
 		Thoughts:      *thoughts,
 		NoACP:         *noACP,
@@ -155,7 +157,8 @@ Options:
   --no-acp                   Use the legacy devin -p path (no incremental streaming)
   --json                     Emit final result as single JSON object
   --file <path>              Read prompt from file
-  --stable-timeout <ms>      Hard cap on the run, in ms (default: 600000)
+  --stable-timeout <ms>      Ms of silence before cancelling (default: 600000)
+  --max-runtime <ms>         Absolute ceiling on the run (default: 7200000)
                              Pre-1.3.0 this was a silence timer against a tmux pane.
   --done-marker <str>        Finish the instant the agent prints this line.
                              Largely moot: devin -p emits only at exit. For reactive
