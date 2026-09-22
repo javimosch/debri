@@ -417,6 +417,11 @@ func buildDevinCommand(opts ExecOptions, promptFile, outFile string) string {
 		}
 	}
 
+	// debri fully owns --working-dir and drives devin entirely non-interactively (tmux send-keys,
+	// no human to answer a prompt), so devin's interactive workspace-trust dialog can never be
+	// answered here. Always bypass it -- debri's own --working-dir is the real trust boundary.
+	parts = append(parts, "--respect-workspace-trust", shellQuote("false"))
+
 	parts = append(parts, "-p", "--prompt-file", shellQuote(promptFile))
 
 	// Redirect stdout (the response) to a file; stderr stays on the pane.
