@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const Version = "1.2.1"
+const Version = "1.3.0"
 
 func main() {
 	// Subcommand dispatch — checked before flag parsing so flags don't interfere.
@@ -35,8 +35,8 @@ func main() {
 	stream := fs.Bool("stream", false, "Emit streaming JSONL events to stdout")
 	jsonOut := fs.Bool("json", false, "Emit final result as single JSON object")
 	promptFile := fs.String("file", "", "Read prompt from file instead of argument")
-	stableTimeout := fs.Int("stable-timeout", 5000, "Stability timeout in ms (silence = done)")
-	doneMarker := fs.String("done-marker", "", "Finish as soon as the agent prints this line (stable-timeout becomes a safety cap). Useful for reactive agents that block on I/O and would otherwise trip the silence timer.")
+	stableTimeout := fs.Int("stable-timeout", defaultRunTimeoutMs, "Hard cap on the run, in ms (was a silence timer pre-1.3.0)")
+	doneMarker := fs.String("done-marker", "", "Finish as soon as the agent prints this line. Largely moot since devin -p emits only at exit; kept for compatibility.")
 	ver := fs.Bool("version", false, "Print version and exit")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
@@ -144,9 +144,10 @@ Options:
   --stream                   Emit streaming JSONL events
   --json                     Emit final result as single JSON object
   --file <path>              Read prompt from file
-  --stable-timeout <ms>      Stability timeout in ms (default: 5000)
-  --done-marker <str>        Finish the instant the agent prints this line
-                             (stable-timeout becomes a safety cap). For reactive
+  --stable-timeout <ms>      Hard cap on the run, in ms (default: 600000)
+                             Pre-1.3.0 this was a silence timer against a tmux pane.
+  --done-marker <str>        Finish the instant the agent prints this line.
+                             Largely moot: devin -p emits only at exit. For reactive
                              agents that block on I/O (e.g. a2a recv --wait).
   --version                  Print version
   -h, --help                 Show this help

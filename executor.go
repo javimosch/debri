@@ -1,36 +1,60 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
-// ExecOptions configures a single debri execution.
 type ExecOptions struct {
 	Model         string // devin model name (empty = devin default)
 	PermMode      string // "auto" or "dangerous"
 	WorkingDir    string // working directory for the session
-	StableTimeout int    // ms of silence before considering output done
-	DoneMarker    string // if the agent prints this line, finish immediately
-	// (stable-timeout becomes a safety cap, not the signal)
+	StableTimeout int    // ms: hard cap on the whole run (see note below)
+	DoneMarker    string // retained for CLI compatibility; see note below
 }
 
-const (
-	pollIntervalMs    = 250
-	maxPolls          = 14400         // 60 min hard cap
-	thinkingTimeoutMs = 5 * 60 * 1000 // 5 min thinking timeout
-)
+// defaultRunTimeoutMs bounds a run when the caller does not pass --stable-timeout.
+// This used to be a 5s *silence* timer against a scraped tmux pane; as a hard cap
+// on the process, 5s would kill every real task, so the default is the old
+// pane-scraper's 10 minute tick ceiling instead.
+const defaultRunTimeoutMs = 600000
 
 var safeNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 
-// Execute creates a fresh devin tmux session, runs the prompt, collects output,
-// then kills the session. onChunk is called for each new output chunk (may be nil).
+// Execute runs devin as an ordinary child process and returns its response.
+//
+// It used to drive devin inside a tmux session and scrape the pane. That existed
+// to solve two problems, neither of which is real any more:
+//
+//   - Clean output. Already not tmux's job: the old code redirected devin's stdout
+//     to a file precisely because the redrawing pane was unreliable to scrape.
+//     devin's `-p` mode writes plain text to stdout when stdout is not a TTY, so a
+//     pipe gives the same clean result directly.
+//   - Liveness / completion. This is exactly what cmd.Wait() reports, exactly, with
+//     no poll interval, no silence heuristics and no "crashed session looked like
+//     success" failure mode.
+//
+// Dropping tmux also removes the orphaned-session leak (#14) by construction: a
+// SIGKILLed debri could never clean up its session, because SIGKILL cannot be
+// trapped. There is now no session to leak, and killing debri kills devin with it
+// (own process group) instead of leaving it running and burning credits unseen.
+//
+// Trade-off, stated plainly: devin `-p` buffers its entire response and emits it at
+// exit (measured: every line of an 18s run arrives at +18s). So onChunk fires once,
+// at the end, and callers no longer see intermediate progress the way pane scraping
+// showed it. Genuine incremental streaming needs `devin acp` (Agent Client Protocol
+// over stdio), not a TUI scraper -- that is the right follow-up, not this layer.
 func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, error) {
 	if prompt == "" {
 		return "", fmt.Errorf("prompt cannot be empty")
@@ -44,395 +68,143 @@ func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, err
 			return "", fmt.Errorf("cannot determine working directory: %w", err)
 		}
 	}
-
-	// Validate model name to prevent shell injection
 	if opts.Model != "" && !isValidModel(opts.Model) {
 		return "", fmt.Errorf("invalid model name: %q", opts.Model)
 	}
 
-	// Write prompt to a temp file in working dir's .devin/ folder
-	// (avoids workspace trust prompts)
-	devinDir := workDir + "/.devin"
+	// The prompt goes to a file rather than an argv entry so a multi-KB briefing
+	// cannot hit ARG_MAX. Prefer the working dir's .devin/ (devin already owns that
+	// path), falling back to /tmp when the workspace is not writable.
+	devinDir := filepath.Join(workDir, ".devin")
 	if err := os.MkdirAll(devinDir, 0755); err != nil {
-		// Fall back to /tmp if we can't write to the working dir
-		devinDir = "/tmp"
+		devinDir = os.TempDir()
 	}
-	nowMs := time.Now().UnixMilli()
-	tmpFile := fmt.Sprintf("%s/debri-prompt-%d.txt", devinDir, nowMs)
-	if err := os.WriteFile(tmpFile, []byte(prompt), 0644); err != nil {
+	promptFile := filepath.Join(devinDir, fmt.Sprintf("debri-prompt-%d.txt", time.Now().UnixMilli()))
+	if err := os.WriteFile(promptFile, []byte(prompt), 0644); err != nil {
 		return "", fmt.Errorf("cannot write prompt file: %w", err)
 	}
-	// devin `-p` buffers its whole response and prints it only at exit, and it
-	// renders a redrawing TUI to the pane while working — so scraping the tmux
-	// pane for the response is unreliable (transient spinner frames inflate the
-	// line watermark, and the final summary is dropped by the diff). Instead
-	// redirect devin's stdout to a file: with stdout not a TTY, devin writes its
-	// clean plain-text response there, which we read on completion. The pane is
-	// used only for liveness (process-exit / trust dialog / stuck detection).
-	outFile := fmt.Sprintf("%s/debri-output-%d.txt", devinDir, nowMs)
-	// Cleanup at end (after devin has read the prompt / we've read the output)
-	defer func() {
-		os.Remove(tmpFile) //nolint: errcheck
-		os.Remove(outFile) //nolint: errcheck
-	}()
+	defer os.Remove(promptFile) //nolint:errcheck
 
-	// Create a fresh tmux session. Include the PID so concurrent debri processes
-	// (e.g. a spawned a2a team, or parallel batch runs) can never collide on the
-	// name — UnixMilli alone duplicates when two starts land in the same
-	// millisecond, and `tmux new-session` then fails with exit 1. Retry with a
-	// bumped suffix as a further guard against a lingering same-name session.
-	base := fmt.Sprintf("devin-debri-%d-%d", time.Now().UnixMilli(), os.Getpid())
-	sessionName := base
-	var newErr error
-	for attempt := 0; attempt < 5; attempt++ {
-		if attempt > 0 {
-			sessionName = fmt.Sprintf("%s-%d", base, attempt)
-		}
-		if newErr = tmuxNew(sessionName, workDir); newErr == nil {
-			break
-		}
-	}
-	if newErr != nil {
-		return "", fmt.Errorf("cannot create tmux session: %w", newErr)
-	}
-	defer tmuxKill(sessionName) //nolint: errcheck
-
-	// A caller that kills debri externally (e.g. `kill $pid` from an a2a team's
-	// teardown, while this agent is still blocked mid-task) sends SIGTERM/SIGINT
-	// straight to the process — Go's normal deferred cleanup above does NOT run
-	// on a raw signal-terminated process, so without this the tmux session leaks
-	// forever. Trap the signal, kill the exact session by the name we already
-	// hold, then exit.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-	defer signal.Stop(sigCh)
-	go func() {
-		sig, ok := <-sigCh
-		if !ok {
-			return
-		}
-		fmt.Fprintf(os.Stderr, "[debri] received %v, cleaning up session %s\n", sig, sessionName)
-		tmuxKill(sessionName) //nolint: errcheck
-		os.Exit(130)
-	}()
-
-	// Short pause for tmux to settle
-	time.Sleep(500 * time.Millisecond)
-
-	// Build the devin command
-	cmd := buildDevinCommand(opts, tmpFile, outFile)
-	fmt.Fprintf(os.Stderr, "[debri] session=%s cmd=%s\n", sessionName, cmd)
-
-	// Capture pane snapshot before sending command
-	preSnap, _ := tmuxCapture(sessionName)
-
-	// Clear screen then run
-	tmuxSend(sessionName, "C-l") //nolint: errcheck
-	time.Sleep(200 * time.Millisecond)
-	tmuxSend(sessionName, cmd)  //nolint: errcheck
-	tmuxSendEnter(sessionName)  //nolint: errcheck
-	time.Sleep(2 * time.Second) // let devin read the prompt file and start
-
-	stableMs := opts.StableTimeout
-	if stableMs <= 0 {
-		stableMs = 5000
-	}
-	stableThreshold := stableMs / pollIntervalMs
-
-	// Two-phase wait: before first output, wait longer (up to 300s)
-	initialThreshold := 300000 / pollIntervalMs
-
-	var (
-		sentLineCount       int
-		stablePolls         int
-		seenPrompt          bool
-		gotFirstOutput      bool
-		allSentLines        []string
-		thinkingStart       time.Time
-		lastRealOutputCount int
-		capturing           bool
-		sawDevinRunning     bool // pane foreground was observed to be non-shell
-	)
-
-	for i := 0; i < maxPolls; i++ {
-		time.Sleep(pollIntervalMs * time.Millisecond)
-
-		rawPane, err := tmuxCapture(sessionName)
-		// The session going missing (tmux errors, or reports no such session) is
-		// never a legitimate completion path — devin's own exit hands the pane
-		// back to the shell (see the process-exit check below) rather than
-		// killing the session. This only happens when something external killed
-		// it (crash, OOM, another process, host issue), so surface it as an
-		// error instead of silently reporting success with whatever partial
-		// output was collected — a caller (or a2a agent) needs to be able to
-		// tell "finished" from "the session vanished mid-task". Checked via err
-		// alone: tmuxCapture uses exec.Cmd.Output(), which returns stdout only —
-		// tmux's "can't find session" text is written to stderr, never to
-		// rawPane, so a string-match against rawPane here can never fire; err
-		// non-nil is the sole real signal.
-		if err != nil {
-			return strings.Join(allSentLines, "\n"), fmt.Errorf(
-				"devin tmux session disappeared unexpectedly after %d polls (crashed, killed externally, or host issue)", i)
-		}
-		if strings.TrimSpace(rawPane) == "" {
-			fmt.Fprintln(os.Stderr, "[debri] pane empty, stopping poll")
-			break
-		}
-
-		// Auto-confirm workspace trust dialog
-		if hasTrustDialog(rawPane) {
-			fmt.Fprintln(os.Stderr, "[debri] trust dialog detected, confirming")
-			tmuxSendEnter(sessionName) //nolint: errcheck
-			time.Sleep(300 * time.Millisecond)
-			continue
-		}
-
-		if !capturing && i > 5 {
-			capturing = true
-		}
-		if !capturing {
-			continue
-		}
-
-		// Detect devin is active
-		if !seenPrompt {
-			paneChanged := preSnap != "" && rawPane != preSnap
-			stuckSec := getStuckSeconds(rawPane)
-			if paneChanged || stuckSec > 0 {
-				seenPrompt = true
-				stablePolls = 0
-				fmt.Fprintf(os.Stderr, "[debri] devin active at poll %d\n", i)
-			} else {
-				if i >= initialThreshold {
-					return "", fmt.Errorf("devin did not start within %ds", initialThreshold*pollIntervalMs/1000)
-				}
-				continue
-			}
-		}
-
-		cleanLines := extractCleanLines(rawPane)
-		responseStart := findResponseStart(cleanLines)
-		responseLines := cleanLines[responseStart:]
-
-		// Pane foreground command, sampled once per poll and reused below for both
-		// the process-exit completion signal and the stability-kill gate. A single
-		// tmux call keeps the two decisions consistent within a poll.
-		fgIsShell := seenPrompt && paneForegroundIsShell(sessionName)
-
-		// Process-exit completion (primary signal): once we've positively seen
-		// devin running (pane foreground = a non-shell), a return to an idle
-		// shell means devin finished and handed the pane back. This needs no
-		// cooperation from the agent and is immune to the `a2a recv --wait`
-		// silence that forced the long stable-timeout cap. Gate on
-		// sawDevinRunning so the shell state at startup (before devin launches)
-		// can't fake an instant completion.
-		if seenPrompt {
-			if fgIsShell {
-				if sawDevinRunning {
-					if len(responseLines) > sentLineCount {
-						for _, l := range responseLines[sentLineCount:] {
-							if l != "" && (opts.DoneMarker == "" || !strings.Contains(l, opts.DoneMarker)) {
-								if onChunk != nil {
-									onChunk(l)
-								}
-								allSentLines = append(allSentLines, l)
-							}
-						}
-					}
-					fmt.Fprintf(os.Stderr, "[debri] devin exited (pane back to shell) at poll %d, finishing\n", i)
-					break
-				}
-			} else {
-				sawDevinRunning = true
-			}
-		}
-
-		// Done-marker fast path: the agent signals completion explicitly (e.g. a
-		// reactive a2a peer that has just marked itself `status done` and echoed
-		// the marker). Scan the RAW pane, not the response-sliced output — devin
-		// returns to a fresh shell prompt after the echo, and findResponseStart
-		// would slice the marker line away. Require the marker on its own line
-		// (trimmed line == marker) so it can't match narration that merely quotes
-		// the echo command. stable-timeout stays a safety cap for when the agent
-		// forgets to print it. Reactive work — like blocking on `a2a recv
-		// --wait N` — no longer risks a mid-wait stable-timeout kill, because the
-		// real exit is now the marker, not silence.
-		if opts.DoneMarker != "" && paneHasMarkerLine(rawPane, opts.DoneMarker) {
-			if len(responseLines) > sentLineCount {
-				for _, l := range responseLines[sentLineCount:] {
-					if l != "" && !strings.Contains(l, opts.DoneMarker) {
-						if onChunk != nil {
-							onChunk(l)
-						}
-						allSentLines = append(allSentLines, l)
-					}
-				}
-			}
-			fmt.Fprintf(os.Stderr, "[debri] done-marker seen at poll %d, finishing\n", i)
-			break
-		}
-
-		// Thinking timeout
-		stuckSec := getStuckSeconds(rawPane)
-		if stuckSec > 0 {
-			if thinkingStart.IsZero() {
-				thinkingStart = time.Now()
-				lastRealOutputCount = sentLineCount
-			} else if time.Since(thinkingStart).Milliseconds() > int64(thinkingTimeoutMs) {
-				fmt.Fprintln(os.Stderr, "[debri] thinking timeout, interrupting")
-				tmuxSend(sessionName, "C-c") //nolint: errcheck
-				thinkingStart = time.Time{}
-			}
-		} else {
-			thinkingStart = time.Time{}
-			_ = lastRealOutputCount
-		}
-
-		// Emit new lines beyond the watermark
-		if len(responseLines) > sentLineCount {
-			newLines := responseLines[sentLineCount:]
-			for _, l := range newLines {
-				if l != "" {
-					if onChunk != nil {
-						onChunk(l)
-					}
-					allSentLines = append(allSentLines, l)
-				}
-			}
-			sentLineCount = len(responseLines)
-			if len(newLines) > 0 {
-				gotFirstOutput = true
-				stablePolls = 0
-			}
-		}
-
-		// Stability check.
-		//
-		// A visually-static pane while devin is STILL the foreground process is
-		// NOT idleness — devin `-p` (print mode) buffers its response and emits no
-		// incremental pane output during long operations: a long model turn, or a
-		// long tool call such as running the whole test suite. Its final summary
-		// only lands the instant it exits. Counting that quiet-but-working state
-		// toward the stable-timeout kills a live agent mid-task — the tmux session
-		// is torn down before devin commits, so the caller sees zero commits and
-		// empty output (observed on large repos: the agent runs ~10min, goes
-		// "stable", and is killed before it ever writes anything).
-		//
-		// devin exits on its own when done — the process-exit path above is the
-		// reliable completion signal for print mode. So only count stability once
-		// devin is no longer the foreground process; while it's running, reset the
-		// counter. The stable-timeout then only guards a truly wedged pane (e.g.
-		// stuck at a prompt the shell is back but detection missed), and the
-		// thinking-timeout + 60min maxPolls remain as hang backstops.
-		if sawDevinRunning && !fgIsShell {
-			stablePolls = 0
-		} else if gotFirstOutput || seenPrompt {
-			stablePolls++
-			threshold := stableThreshold
-			if !gotFirstOutput {
-				threshold = initialThreshold
-			}
-			if stablePolls >= threshold {
-				fmt.Fprintf(os.Stderr, "[debri] stable after %d polls\n", i)
-				break
-			}
-		}
-	}
-
-	// Prefer devin's redirected stdout — its clean, complete plain-text response —
-	// over the pane-scraped lines, which drop the final buffered summary. Fall
-	// back to the scraped lines if the file is missing/empty (e.g. devin was
-	// interrupted before flushing, or an older devin that ignores the redirect).
-	if data, err := os.ReadFile(outFile); err == nil {
-		if s := strings.TrimSpace(string(data)); s != "" {
-			return s, nil
-		}
-	}
-	return strings.Join(allSentLines, "\n"), nil
-}
-
-// knownShells are the foreground commands that mean the pane has returned to an
-// idle prompt. devin runs in `-p` (single-prompt) mode and exits when the task
-// is complete, handing the pane back to the shell — a far more reliable "done"
-// signal than a model-emitted marker (which the agent may narrate instead of
-// run) or a silence timer (which a blocking `a2a recv --wait` trips falsely).
-var knownShells = map[string]bool{
-	"zsh": true, "-zsh": true, "bash": true, "-bash": true,
-	"sh": true, "-sh": true, "dash": true, "fish": true, "-fish": true,
-}
-
-// paneForegroundIsShell reports whether the pane's current foreground command is
-// an idle shell (i.e. devin has exited). Returns false on any tmux error so a
-// transient failure never fakes a completion.
-func paneForegroundIsShell(session string) bool {
-	out, err := exec.Command("tmux", "display-message", "-p", "-t", session,
-		"#{pane_current_command}").Output()
-	if err != nil {
-		return false
-	}
-	return knownShells[strings.TrimSpace(string(out))]
-}
-
-// paneHasMarkerLine reports whether any line of the raw tmux pane, trimmed of
-// surrounding whitespace, equals the marker exactly. Exact-line match (not
-// substring) so a narration line that quotes the echo command does not trip it.
-func paneHasMarkerLine(rawPane, marker string) bool {
-	for _, line := range strings.Split(rawPane, "\n") {
-		if strings.TrimSpace(line) == marker {
-			return true
-		}
-	}
-	return false
-}
-
-// buildDevinCommand assembles the devin CLI invocation string. devin's stdout
-// (its buffered plain-text response) is redirected to outFile so the caller can
-// read a clean result rather than scraping the redrawing tmux pane; stderr stays
-// on the pane so liveness detection (process-exit, stuck/trust dialogs) still
-// works.
-func buildDevinCommand(opts ExecOptions, promptFile, outFile string) string {
-	var parts []string
-
-	// Resolve devin path
 	devinPath, err := exec.LookPath("devin")
 	if err != nil {
-		devinPath = "devin" // fallback, will fail in tmux if not in PATH
+		return "", fmt.Errorf("devin not found in PATH: %w", err)
 	}
-	parts = append(parts, devinPath)
 
+	// argv, not a shell string: no quoting, and therefore no shell-injection surface
+	// for the model/path values to defend against.
+	args := []string{}
 	if opts.Model != "" {
-		parts = append(parts, "--model", shellQuote(opts.Model))
+		args = append(args, "--model", opts.Model)
 	}
-
 	permMode := opts.PermMode
 	if permMode == "" {
 		permMode = "dangerous"
 	}
-	parts = append(parts, "--permission-mode", shellQuote(permMode))
+	args = append(args, "--permission-mode", permMode)
+	if cfg := filepath.Join(workDir, ".devin", "config.json"); fileExists(cfg) {
+		args = append(args, "--config", cfg)
+	}
+	// Non-interactive mode cannot answer devin's workspace-trust dialog, and debri
+	// always owns --working-dir, so the trust check can only ever deadlock us here.
+	args = append(args, "--respect-workspace-trust", "false", "-p", "--prompt-file", promptFile)
 
-	if opts.WorkingDir != "" {
-		cfgPath := opts.WorkingDir + "/.devin/config.json"
-		if _, err := os.Stat(cfgPath); err == nil {
-			parts = append(parts, "--config", shellQuote(cfgPath))
+	timeoutMs := opts.StableTimeout
+	if timeoutMs <= 0 {
+		timeoutMs = defaultRunTimeoutMs
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, devinPath, args...)
+	cmd.Dir = workDir
+	// Own process group: a timeout or a signal kills devin and anything it spawned,
+	// rather than orphaning a running agent.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", err
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return "", err
+	}
+
+	fmt.Fprintf(os.Stderr, "[debri] exec %s %s\n", devinPath, strings.Join(args, " "))
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("cannot start devin: %w", err)
+	}
+
+	killGroup := func() {
+		if cmd.Process != nil {
+			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) //nolint:errcheck
 		}
 	}
+	// SIGTERM/SIGINT from a caller must take devin down too; deferred cleanup does
+	// not run for a signal-terminated process.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sigCh)
+	go func() {
+		if sig, ok := <-sigCh; ok {
+			fmt.Fprintf(os.Stderr, "[debri] received %v, terminating devin\n", sig)
+			killGroup()
+			os.Exit(130)
+		}
+	}()
 
-	// debri fully owns --working-dir and drives devin entirely non-interactively (tmux send-keys,
-	// no human to answer a prompt), so devin's interactive workspace-trust dialog can never be
-	// answered here. Always bypass it -- debri's own --working-dir is the real trust boundary.
-	parts = append(parts, "--respect-workspace-trust", shellQuote("false"))
+	var out strings.Builder
+	var stderrBuf strings.Builder
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { // stderr is diagnostics only; devin's answer is on stdout
+		defer wg.Done()
+		b, _ := io.ReadAll(stderrPipe)
+		stderrBuf.Write(b)
+	}()
 
-	parts = append(parts, "-p", "--prompt-file", shellQuote(promptFile))
-
-	// Redirect stdout (the response) to a file; stderr stays on the pane.
-	if outFile != "" {
-		parts = append(parts, ">", shellQuote(outFile))
+	sc := bufio.NewScanner(stdout)
+	sc.Buffer(make([]byte, 1024*1024), 32*1024*1024) // a long answer is one long line
+	for sc.Scan() {
+		line := sc.Text()
+		out.WriteString(line)
+		out.WriteString("\n")
+		if onChunk != nil {
+			onChunk(line)
+		}
+		// DoneMarker is retained for flag compatibility, but devin -p emits nothing
+		// before exit, so in practice the process has already finished by the time a
+		// marker could match. Honour it anyway for any caller/mode that does stream.
+		if opts.DoneMarker != "" && strings.Contains(line, opts.DoneMarker) {
+			killGroup()
+			break
+		}
 	}
+	wg.Wait()
 
-	return strings.Join(parts, " ")
+	waitErr := cmd.Wait()
+	content := strings.TrimSpace(out.String())
+
+	if ctx.Err() == context.DeadlineExceeded {
+		return content, fmt.Errorf("devin exceeded the %dms cap", timeoutMs)
+	}
+	if waitErr != nil && content == "" {
+		msg := strings.TrimSpace(stderrBuf.String())
+		if msg == "" {
+			msg = waitErr.Error()
+		}
+		return "", fmt.Errorf("devin failed: %s", msg)
+	}
+	return content, nil
 }
 
-// isValidModel validates a model name to prevent shell injection.
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}
+
+// isValidModel keeps obviously malformed model names out of the argv. With no shell
+// involved this is plain validation, not an injection defence.
 func isValidModel(model string) bool {
 	known := []string{"SWE-1.6", "Kimi K2.6", "claude-sonnet-4", "claude-opus-4.6", "opus", "codex", "adaptive"}
 	for _, k := range known {
@@ -441,39 +213,4 @@ func isValidModel(model string) bool {
 		}
 	}
 	return safeNameRe.MatchString(model)
-}
-
-// shellQuote wraps s in single quotes and escapes embedded single quotes.
-func shellQuote(s string) string {
-	if s == "" {
-		return "''"
-	}
-	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
-}
-
-// --- tmux helpers ---
-
-func tmuxNew(session, workDir string) error {
-	return exec.Command("tmux", "new-session", "-d", "-s", session, "-c", workDir).Run()
-}
-
-func tmuxKill(session string) error {
-	return exec.Command("tmux", "kill-session", "-t", session).Run()
-}
-
-func tmuxSend(session, keys string) error {
-	// Target the session by name only — no :window.pane suffix — so the command
-	// works regardless of the operator's tmux pane-base-index setting. Using
-	// ":0.0" fails when pane-base-index=1, causing executor to see "session gone"
-	// even though devin is still running.
-	return exec.Command("tmux", "send-keys", "-t", session, keys).Run()
-}
-
-func tmuxSendEnter(session string) error {
-	return exec.Command("tmux", "send-keys", "-t", session, "Enter").Run()
-}
-
-func tmuxCapture(session string) (string, error) {
-	out, err := exec.Command("tmux", "capture-pane", "-t", session, "-p", "-J").Output()
-	return string(out), err
 }
