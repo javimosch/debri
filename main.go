@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const Version = "1.3.0"
+const Version = "1.4.0"
 
 func main() {
 	// Subcommand dispatch — checked before flag parsing so flags don't interfere.
@@ -37,6 +37,8 @@ func main() {
 	promptFile := fs.String("file", "", "Read prompt from file instead of argument")
 	stableTimeout := fs.Int("stable-timeout", defaultRunTimeoutMs, "Hard cap on the run, in ms (was a silence timer pre-1.3.0)")
 	doneMarker := fs.String("done-marker", "", "Finish as soon as the agent prints this line. Largely moot since devin -p emits only at exit; kept for compatibility.")
+	thoughts := fs.Bool("thoughts", false, "Stream the agent's reasoning as {\"event\":\"thought\"} (ACP only)")
+	noACP := fs.Bool("no-acp", false, "Use the legacy `devin -p` path instead of ACP streaming")
 	ver := fs.Bool("version", false, "Print version and exit")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
@@ -82,6 +84,13 @@ func main() {
 		WorkingDir:    *workingDir,
 		StableTimeout: *stableTimeout,
 		DoneMarker:    *doneMarker,
+		Thoughts:      *thoughts,
+		NoACP:         *noACP,
+	}
+	// Richer ACP events (tool calls, thoughts) only make sense on the JSONL stream. Unknown
+	// event types are ignorable by design, so existing consumers are unaffected.
+	if *stream {
+		opts.OnEvent = func(ev map[string]any) { emitEvent(ev) }
 	}
 
 	start := time.Now()
@@ -142,6 +151,8 @@ Options:
   --permission-mode <mode>   "auto" or "dangerous" (default: dangerous)
   --working-dir <dir>        Working directory for the session
   --stream                   Emit streaming JSONL events
+  --thoughts                 Also stream the agent's reasoning as "thought" events
+  --no-acp                   Use the legacy devin -p path (no incremental streaming)
   --json                     Emit final result as single JSON object
   --file <path>              Read prompt from file
   --stable-timeout <ms>      Hard cap on the run, in ms (default: 600000)
@@ -155,6 +166,8 @@ Options:
 JSONL stream events:
   {"event":"init","status":"ok"}
   {"event":"chunk","content":"..."}
+  {"event":"tool","tool_call_id":"...","title":"...","kind":"...","status":"..."}
+  {"event":"thought","content":"..."}          (only with --thoughts)
   {"event":"done","content":"...","elapsed_ms":1234}
   {"event":"error","error":"...","elapsed_ms":1234}
 

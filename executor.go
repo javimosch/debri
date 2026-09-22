@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,63 +19,113 @@ import (
 
 type ExecOptions struct {
 	Model         string // devin model name (empty = devin default)
-	PermMode      string // "auto" or "dangerous"
+	PermMode      string // "auto" (read-only) or "dangerous"
 	WorkingDir    string // working directory for the session
-	StableTimeout int    // ms: hard cap on the whole run (see note below)
-	DoneMarker    string // retained for CLI compatibility; see note below
+	StableTimeout int    // ms: hard cap on the whole run
+	DoneMarker    string // finish as soon as this text appears (meaningful again under ACP)
+	Thoughts      bool   // stream the agent's reasoning as {"event":"thought"}
+	NoACP         bool   // force the legacy `devin -p` path instead of ACP
+	// OnEvent receives the richer structured events ACP makes available (tool calls,
+	// thoughts). nil is fine; plain text chunks still go to Execute's onChunk.
+	OnEvent func(map[string]any)
 }
 
-// defaultRunTimeoutMs bounds a run when the caller does not pass --stable-timeout.
-// This used to be a 5s *silence* timer against a scraped tmux pane; as a hard cap
-// on the process, 5s would kill every real task, so the default is the old
-// pane-scraper's 10 minute tick ceiling instead.
+// defaultRunTimeoutMs bounds a run when the caller does not pass --stable-timeout. Pre-1.3.0
+// this was a 5s *silence* timer against a scraped tmux pane; as a hard cap on the run, 5s would
+// kill every real task, so the default is the old pane-scraper's 10 minute tick ceiling.
 const defaultRunTimeoutMs = 600000
 
 var safeNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 
-// Execute runs devin as an ordinary child process and returns its response.
+// Execute runs one prompt through devin and returns the agent's answer.
 //
-// It used to drive devin inside a tmux session and scrape the pane. That existed
-// to solve two problems, neither of which is real any more:
+// Preferred path is ACP (acp.go): `devin acp` speaks JSON-RPC over stdio and streams
+// `agent_message_chunk` notifications token by token, plus structured tool-call events. The
+// fallback is `devin -p`, which is correct but buffers its entire answer until exit -- so it can
+// only ever report progress once, at the end.
 //
-//   - Clean output. Already not tmux's job: the old code redirected devin's stdout
-//     to a file precisely because the redrawing pane was unreliable to scrape.
-//     devin's `-p` mode writes plain text to stdout when stdout is not a TTY, so a
-//     pipe gives the same clean result directly.
-//   - Liveness / completion. This is exactly what cmd.Wait() reports, exactly, with
-//     no poll interval, no silence heuristics and no "crashed session looked like
-//     success" failure mode.
-//
-// Dropping tmux also removes the orphaned-session leak (#14) by construction: a
-// SIGKILLed debri could never clean up its session, because SIGKILL cannot be
-// trapped. There is now no session to leak, and killing debri kills devin with it
-// (own process group) instead of leaving it running and burning credits unseen.
-//
-// Trade-off, stated plainly: devin `-p` buffers its entire response and emits it at
-// exit (measured: every line of an 18s run arrives at +18s). So onChunk fires once,
-// at the end, and callers no longer see intermediate progress the way pane scraping
-// showed it. Genuine incremental streaming needs `devin acp` (Agent Client Protocol
-// over stdio), not a TUI scraper -- that is the right follow-up, not this layer.
+// Neither path uses tmux. That layer existed to scrape a TUI pane for output and liveness;
+// output was already being redirected to a file because the pane was unreliable, and liveness is
+// what cmd.Wait() / the ACP turn result report exactly. Removing it also removed the orphaned
+// session leak (#14) by construction, since SIGKILL can never run a deferred cleanup.
 func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, error) {
 	if prompt == "" {
 		return "", fmt.Errorf("prompt cannot be empty")
 	}
-
-	workDir := opts.WorkingDir
-	if workDir == "" {
-		var err error
-		workDir, err = os.Getwd()
-		if err != nil {
-			return "", fmt.Errorf("cannot determine working directory: %w", err)
-		}
+	workDir, err := resolveWorkDir(opts)
+	if err != nil {
+		return "", err
 	}
 	if opts.Model != "" && !isValidModel(opts.Model) {
 		return "", fmt.Errorf("invalid model name: %q", opts.Model)
 	}
 
-	// The prompt goes to a file rather than an argv entry so a multi-KB briefing
-	// cannot hit ARG_MAX. Prefer the working dir's .devin/ (devin already owns that
-	// path), falling back to /tmp when the workspace is not writable.
+	timeoutMs := opts.StableTimeout
+	if timeoutMs <= 0 {
+		timeoutMs = defaultRunTimeoutMs
+	}
+	opts.StableTimeout = timeoutMs
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
+	defer cancel()
+
+	if !opts.NoACP {
+		content, err := executeACP(ctx, prompt, opts, workDir, onChunk)
+		if err == nil {
+			return content, nil
+		}
+		// Only a failure to *establish* the session falls back. Once the agent is running, a
+		// real error must surface rather than silently re-running expensive work on -p.
+		if !errors.Is(err, errACPUnavailable) {
+			return content, err
+		}
+		fmt.Fprintf(os.Stderr, "[debri] acp unavailable (%v) — falling back to devin -p\n", err)
+		if ctx.Err() != nil {
+			// The handshake consumed the whole budget; report that plainly rather than
+			// letting the fallback fail with an opaque "cannot start devin".
+			return "", fmt.Errorf("devin exceeded the %dms cap", opts.StableTimeout)
+		}
+	}
+	return executePrint(ctx, prompt, opts, workDir, onChunk)
+}
+
+func resolveWorkDir(opts ExecOptions) (string, error) {
+	if opts.WorkingDir != "" {
+		return opts.WorkingDir, nil
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("cannot determine working directory: %w", err)
+	}
+	return wd, nil
+}
+
+// killOnSignal arranges for the child's process group to die with us. Deferred cleanup does not
+// run for a signal-terminated process, so without this a SIGTERMed debri would leave devin
+// running and burning credits unseen.
+func killOnSignal(pid func() int) (stop func()) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case sig := <-ch:
+			fmt.Fprintf(os.Stderr, "[debri] received %v, terminating devin\n", sig)
+			if p := pid(); p > 0 {
+				syscall.Kill(-p, syscall.SIGKILL) //nolint:errcheck
+			}
+			os.Exit(130)
+		case <-done:
+		}
+	}()
+	return func() { signal.Stop(ch); close(done) }
+}
+
+// executePrint is the pre-ACP path: run `devin -p` as a child process and read its stdout. Kept
+// as the fallback for a devin build whose `acp` surface we cannot speak to.
+func executePrint(ctx context.Context, prompt string, opts ExecOptions, workDir string, onChunk func(string)) (string, error) {
+	// The prompt goes to a file rather than an argv entry so a multi-KB briefing cannot hit
+	// ARG_MAX. Prefer the working dir's .devin/ (devin already owns that path), falling back to
+	// /tmp when the workspace is not writable.
 	devinDir := filepath.Join(workDir, ".devin")
 	if err := os.MkdirAll(devinDir, 0755); err != nil {
 		devinDir = os.TempDir()
@@ -90,8 +141,7 @@ func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, err
 		return "", fmt.Errorf("devin not found in PATH: %w", err)
 	}
 
-	// argv, not a shell string: no quoting, and therefore no shell-injection surface
-	// for the model/path values to defend against.
+	// argv, not a shell string: no quoting, and therefore no shell-injection surface.
 	args := []string{}
 	if opts.Model != "" {
 		args = append(args, "--model", opts.Model)
@@ -104,21 +154,12 @@ func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, err
 	if cfg := filepath.Join(workDir, ".devin", "config.json"); fileExists(cfg) {
 		args = append(args, "--config", cfg)
 	}
-	// Non-interactive mode cannot answer devin's workspace-trust dialog, and debri
-	// always owns --working-dir, so the trust check can only ever deadlock us here.
+	// Non-interactive mode cannot answer devin's workspace-trust dialog, and debri always owns
+	// --working-dir, so the trust check can only ever deadlock us here.
 	args = append(args, "--respect-workspace-trust", "false", "-p", "--prompt-file", promptFile)
-
-	timeoutMs := opts.StableTimeout
-	if timeoutMs <= 0 {
-		timeoutMs = defaultRunTimeoutMs
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
-	defer cancel()
 
 	cmd := exec.CommandContext(ctx, devinPath, args...)
 	cmd.Dir = workDir
-	// Own process group: a timeout or a signal kills devin and anything it spawned,
-	// rather than orphaning a running agent.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	stdout, err := cmd.StdoutPipe()
@@ -134,24 +175,13 @@ func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, err
 	if err := cmd.Start(); err != nil {
 		return "", fmt.Errorf("cannot start devin: %w", err)
 	}
-
-	killGroup := func() {
+	stopSignals := killOnSignal(func() int {
 		if cmd.Process != nil {
-			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) //nolint:errcheck
+			return cmd.Process.Pid
 		}
-	}
-	// SIGTERM/SIGINT from a caller must take devin down too; deferred cleanup does
-	// not run for a signal-terminated process.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-	defer signal.Stop(sigCh)
-	go func() {
-		if sig, ok := <-sigCh; ok {
-			fmt.Fprintf(os.Stderr, "[debri] received %v, terminating devin\n", sig)
-			killGroup()
-			os.Exit(130)
-		}
-	}()
+		return 0
+	})
+	defer stopSignals()
 
 	var out strings.Builder
 	var stderrBuf strings.Builder
@@ -172,11 +202,10 @@ func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, err
 		if onChunk != nil {
 			onChunk(line)
 		}
-		// DoneMarker is retained for flag compatibility, but devin -p emits nothing
-		// before exit, so in practice the process has already finished by the time a
-		// marker could match. Honour it anyway for any caller/mode that does stream.
 		if opts.DoneMarker != "" && strings.Contains(line, opts.DoneMarker) {
-			killGroup()
+			if cmd.Process != nil {
+				syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) //nolint:errcheck
+			}
 			break
 		}
 	}
@@ -186,7 +215,7 @@ func Execute(prompt string, opts ExecOptions, onChunk func(string)) (string, err
 	content := strings.TrimSpace(out.String())
 
 	if ctx.Err() == context.DeadlineExceeded {
-		return content, fmt.Errorf("devin exceeded the %dms cap", timeoutMs)
+		return content, fmt.Errorf("devin exceeded the %dms cap", opts.StableTimeout)
 	}
 	if waitErr != nil && content == "" {
 		msg := strings.TrimSpace(stderrBuf.String())
@@ -203,8 +232,8 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
-// isValidModel keeps obviously malformed model names out of the argv. With no shell
-// involved this is plain validation, not an injection defence.
+// isValidModel keeps obviously malformed model names out of the argv. With no shell involved
+// this is plain validation, not an injection defence.
 func isValidModel(model string) bool {
 	known := []string{"SWE-1.6", "Kimi K2.6", "claude-sonnet-4", "claude-opus-4.6", "opus", "codex", "adaptive"}
 	for _, k := range known {

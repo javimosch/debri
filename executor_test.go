@@ -18,17 +18,17 @@ func TestExecute_EmptyPromptRejected(t *testing.T) {
 // TestExecute_InvalidModelRejected guards the argv from obviously malformed model
 // names before we spawn anything.
 func TestExecute_InvalidModelRejected(t *testing.T) {
-	_, err := Execute("hi", ExecOptions{Model: "bad model; rm -rf /"}, nil)
+	_, err := Execute("hi", ExecOptions{Model: "bad model; rm -rf /", NoACP: true}, nil)
 	if err == nil || !strings.Contains(err.Error(), "invalid model name") {
 		t.Errorf("malformed model must be rejected, got: %v", err)
 	}
 }
 
-// TestExecute_WritesPromptToFileNotArgv: the briefing is handed over as a file so a
+// TestExecutePrint_WritesPromptToFileNotArgv (-p fallback path): the briefing is handed over as a file so a
 // multi-KB prompt can never hit ARG_MAX. We assert the file is created under the
 // working dir's .devin/ and cleaned up afterwards, by pointing devin at a stub that
 // records the argv it was given.
-func TestExecute_WritesPromptToFileNotArgv(t *testing.T) {
+func TestExecutePrint_WritesPromptToFileNotArgv(t *testing.T) {
 	workDir := t.TempDir()
 	binDir := t.TempDir()
 	argvLog := filepath.Join(binDir, "argv.txt")
@@ -40,7 +40,7 @@ func TestExecute_WritesPromptToFileNotArgv(t *testing.T) {
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
 
 	prompt := strings.Repeat("x", 4096)
-	out, err := Execute(prompt, ExecOptions{WorkingDir: workDir, StableTimeout: 30000}, nil)
+	out, err := Execute(prompt, ExecOptions{WorkingDir: workDir, StableTimeout: 30000, NoACP: true}, nil)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestExecute_WritesPromptToFileNotArgv(t *testing.T) {
 
 // TestExecute_SurfacesStderrOnFailure: when devin exits non-zero with nothing on
 // stdout, the caller gets devin's own stderr rather than a bare "exit status 1".
-func TestExecute_SurfacesStderrOnFailure(t *testing.T) {
+func TestExecutePrint_SurfacesStderrOnFailure(t *testing.T) {
 	workDir := t.TempDir()
 	binDir := t.TempDir()
 	stub := "#!/bin/sh\necho 'devin exploded' >&2\nexit 1\n"
@@ -82,7 +82,7 @@ func TestExecute_SurfacesStderrOnFailure(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
 
-	_, err := Execute("hi", ExecOptions{WorkingDir: workDir, StableTimeout: 30000}, nil)
+	_, err := Execute("hi", ExecOptions{WorkingDir: workDir, StableTimeout: 30000, NoACP: true}, nil)
 	if err == nil || !strings.Contains(err.Error(), "devin exploded") {
 		t.Errorf("stderr must be surfaced, got: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestExecute_SurfacesStderrOnFailure(t *testing.T) {
 // TestExecute_HardTimeoutKillsDevin: --stable-timeout is a hard cap on the run now
 // (it used to be a silence timer against a scraped pane). A hung devin must be
 // killed and reported, not waited on forever.
-func TestExecute_HardTimeoutKillsDevin(t *testing.T) {
+func TestExecutePrint_HardTimeoutKillsDevin(t *testing.T) {
 	workDir := t.TempDir()
 	binDir := t.TempDir()
 	stub := "#!/bin/sh\nsleep 60\n"
@@ -100,7 +100,7 @@ func TestExecute_HardTimeoutKillsDevin(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
 
-	_, err := Execute("hi", ExecOptions{WorkingDir: workDir, StableTimeout: 300}, nil)
+	_, err := Execute("hi", ExecOptions{WorkingDir: workDir, StableTimeout: 300, NoACP: true}, nil)
 	if err == nil || !strings.Contains(err.Error(), "cap") {
 		t.Errorf("expected a timeout error, got: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestExecute_HardTimeoutKillsDevin(t *testing.T) {
 // TestExecute_NoTmuxSessionsCreated is the regression guard for #14: the executor
 // must not create tmux sessions at all, so there is nothing that can be orphaned
 // when debri is SIGKILLed.
-func TestExecute_NoTmuxSessionsCreated(t *testing.T) {
+func TestExecutePrint_NoTmuxSessionsCreated(t *testing.T) {
 	workDir := t.TempDir()
 	binDir := t.TempDir()
 	tmuxLog := filepath.Join(binDir, "tmux-was-called.txt")
@@ -125,7 +125,7 @@ func TestExecute_NoTmuxSessionsCreated(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
 
-	if _, err := Execute("hi", ExecOptions{WorkingDir: workDir, StableTimeout: 30000}, nil); err != nil {
+	if _, err := Execute("hi", ExecOptions{WorkingDir: workDir, StableTimeout: 30000, NoACP: true}, nil); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
 	if _, err := os.Stat(tmuxLog); err == nil {
